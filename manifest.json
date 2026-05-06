@@ -1,10 +1,10 @@
 {
   "id": "folder-crypto",
   "name": "Folder Crypto",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "minAppVersion": "1.5.0",
-  "description": "Encrypt and decrypt Markdown files inside a selected Obsidian folder.",
-  "author": "Local",
+  "description": "Lock Obsidian folders and optionally encrypt Markdown files inside selected folders.",
+  "author": "JasonSting",
   "authorUrl": "",
   "isDesktopOnly": true
 }
