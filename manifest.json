@@ -3,7 +3,7 @@
   "name": "Folder Crypto",
   "version": "0.1.5",
   "minAppVersion": "1.5.0",
-  "description": "Lock Obsidian folders and optionally encrypt Markdown files inside selected folders.",
+  "description": "Lock folders and optionally encrypt Markdown files inside selected folders.",
   "author": "JasonSting",
   "authorUrl": "",
   "isDesktopOnly": true
