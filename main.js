@@ -1,10 +1,11 @@
 'use strict';
 
-const crypto = require('crypto');
 const obsidian = require('obsidian');
 
 const ENCRYPTION_MARKER = '%% folder-crypto: encrypted %%';
 const ENVELOPE_VERSION = 1;
+const LOCK_BADGE_CLASS = 'folder-crypto-lock-badge';
+const HIDDEN_ITEM_CLASS = 'folder-crypto-hidden-item';
 const DEFAULT_SETTINGS = {
   folderPath: '',
   folderLockEnabled: false,
@@ -32,21 +33,26 @@ function isEncryptedContent(content) {
   return content.trimStart().startsWith(ENCRYPTION_MARKER);
 }
 
-function toBase64(buffer) {
-  return Buffer.from(buffer).toString('base64');
+function toBase64(bytes) {
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let binary = '';
+  for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);
+  return btoa(binary);
 }
 
-function fromBase64(value) {
-  return Buffer.from(value, 'base64');
+function fromBase64(str) {
+  const binary = atob(str);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function randomBytes(n) {
+  return (globalThis.crypto || window.crypto).getRandomValues(new Uint8Array(n));
 }
 
 function buildEncryptedNote(envelope) {
-  return `${ENCRYPTION_MARKER}
-
-\`\`\`json
-${JSON.stringify(envelope, null, 2)}
-\`\`\`
-`;
+  return `${ENCRYPTION_MARKER}\n\n\`\`\`json\n${JSON.stringify(envelope, null, 2)}\n\`\`\`\n`;
 }
 
 function parseEncryptedNote(content) {
@@ -60,14 +66,45 @@ function parseEncryptedNote(content) {
   return JSON.parse(match[1]);
 }
 
-function deriveKey(password, salt, iterations) {
-  return crypto.pbkdf2Sync(password, salt, iterations, 32, 'sha256');
+function getWebCrypto() {
+  return globalThis.crypto || window.crypto;
 }
 
-function hashPassword(password) {
-  const salt = crypto.randomBytes(16);
+async function importPbkdf2Key(password) {
+  return getWebCrypto().subtle.importKey(
+    'raw',
+    new TextEncoder().encode(password),
+    'PBKDF2',
+    false,
+    ['deriveBits', 'deriveKey']
+  );
+}
+
+async function deriveBits(password, salt, iterations) {
+  const keyMaterial = await importPbkdf2Key(password);
+  const bits = await getWebCrypto().subtle.deriveBits(
+    { name: 'PBKDF2', salt: salt instanceof Uint8Array ? salt : fromBase64(salt), iterations, hash: 'SHA-256' },
+    keyMaterial,
+    256
+  );
+  return new Uint8Array(bits);
+}
+
+async function deriveAesKey(password, salt, iterations) {
+  const keyMaterial = await importPbkdf2Key(password);
+  return getWebCrypto().subtle.deriveKey(
+    { name: 'PBKDF2', salt: salt instanceof Uint8Array ? salt : fromBase64(salt), iterations, hash: 'SHA-256' },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+async function hashPassword(password) {
+  const salt = randomBytes(16);
   const iterations = 210000;
-  const hash = deriveKey(password, salt, iterations);
+  const hash = await deriveBits(password, salt, iterations);
   return {
     kdf: 'pbkdf2-sha256',
     iterations,
@@ -76,10 +113,13 @@ function hashPassword(password) {
   };
 }
 
-function verifyPassword(password, verifier) {
+async function verifyPassword(password, verifier) {
   const expected = fromBase64(verifier.hash);
-  const actual = deriveKey(password, fromBase64(verifier.salt), Number(verifier.iterations || 210000));
-  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+  const actual = await deriveBits(password, fromBase64(verifier.salt), Number(verifier.iterations || 210000));
+  if (expected.length !== actual.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= expected[i] ^ actual[i];
+  return diff === 0;
 }
 
 function pathIsInsideFolder(path, folderPath) {
@@ -109,17 +149,20 @@ function getNodeModule(name) {
   }
 }
 
-function encryptText(plaintext, password) {
-  const salt = crypto.randomBytes(16);
-  const iv = crypto.randomBytes(12);
+async function encryptText(plaintext, password) {
+  const salt = randomBytes(16);
+  const iv = randomBytes(12);
   const iterations = 210000;
-  const key = deriveKey(password, salt, iterations);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  const ciphertext = Buffer.concat([
-    cipher.update(Buffer.from(plaintext, 'utf8')),
-    cipher.final()
-  ]);
-  const tag = cipher.getAuthTag();
+  const key = await deriveAesKey(password, salt, iterations);
+  const encrypted = await getWebCrypto().subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    new TextEncoder().encode(plaintext)
+  );
+  const encryptedBytes = new Uint8Array(encrypted);
+  const tagOffset = encryptedBytes.length - 16;
+  const data = encryptedBytes.slice(0, tagOffset);
+  const tag = encryptedBytes.slice(tagOffset);
 
   return buildEncryptedNote({
     version: ENVELOPE_VERSION,
@@ -129,11 +172,11 @@ function encryptText(plaintext, password) {
     salt: toBase64(salt),
     iv: toBase64(iv),
     tag: toBase64(tag),
-    data: toBase64(ciphertext)
+    data: toBase64(data)
   });
 }
 
-function decryptText(content, password) {
+async function decryptText(content, password) {
   const envelope = parseEncryptedNote(content);
   if (envelope.version !== ENVELOPE_VERSION || envelope.algorithm !== 'aes-256-gcm') {
     throw new Error('Unsupported encrypted file version.');
@@ -142,11 +185,20 @@ function decryptText(content, password) {
   const salt = fromBase64(envelope.salt);
   const iv = fromBase64(envelope.iv);
   const tag = fromBase64(envelope.tag);
-  const ciphertext = fromBase64(envelope.data);
-  const key = deriveKey(password, salt, Number(envelope.iterations || 210000));
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-  decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+  const data = fromBase64(envelope.data);
+
+  // Web Crypto expects ciphertext + auth tag concatenated
+  const ciphertext = new Uint8Array(data.length + tag.length);
+  ciphertext.set(data);
+  ciphertext.set(tag, data.length);
+
+  const key = await deriveAesKey(password, salt, Number(envelope.iterations || 210000));
+  const decrypted = await getWebCrypto().subtle.decrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    ciphertext
+  );
+  return new TextDecoder().decode(decrypted);
 }
 
 class PasswordModal extends obsidian.Modal {
@@ -289,20 +341,73 @@ class FolderCryptoSettingTab extends obsidian.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl('h3', { text: 'Shared folder target' });
+    // === Locked Folders ===
+    containerEl.createEl('h3', { text: 'Locked folders' });
 
-    new obsidian.Setting(containerEl)
-      .setName('Folder path')
-      .setDesc('Vault-relative folder path, for example Private or things/secret.')
-      .addText((text) => {
-        text
-          .setPlaceholder('Private')
-          .setValue(this.plugin.settings.folderPath)
-          .onChange(async (value) => {
-            this.plugin.settings.folderPath = normalizeFolderPath(value);
-            await this.plugin.saveSettings();
-          });
+    if (this.plugin.settings.lockedFolders.length === 0) {
+      containerEl.createEl('p', {
+        text: 'No folders locked yet. Add a folder below or right-click any folder in the file explorer.',
+        cls: 'setting-item-description'
       });
+    }
+
+    for (const lock of [...this.plugin.settings.lockedFolders]) {
+      const isUnlocked = this.plugin.unlockedFolders.has(lock.path);
+      const row = new obsidian.Setting(containerEl)
+        .setName(lock.path)
+        .setDesc(isUnlocked ? 'Unlocked this session' : 'Locked');
+
+      if (isUnlocked) {
+        row.addButton((btn) => {
+          btn.setButtonText('Lock').onClick(async () => {
+            await this.plugin.lockFolder(lock.path);
+            this.display();
+          });
+        });
+      } else {
+        row.addButton((btn) => {
+          btn.setButtonText('Unlock').onClick(async () => {
+            await this.plugin.unlockFolder(lock.path);
+            this.display();
+          });
+        });
+      }
+
+      row.addButton((btn) => {
+        btn.setButtonText('Remove').setWarning().onClick(async () => {
+          await this.plugin.removeFolderLock(lock.path);
+          this.display();
+        });
+      });
+    }
+
+    let newFolderPath = '';
+    new obsidian.Setting(containerEl)
+      .setName('Add folder lock')
+      .setDesc('Vault-relative path, e.g. Private or work/secret. Right-click any folder in the file explorer also works.')
+      .addText((text) => {
+        text.setPlaceholder('FolderName').onChange((value) => {
+          newFolderPath = value;
+        });
+      })
+      .addButton((btn) => {
+        btn.setButtonText('Lock').setCta().onClick(async () => {
+          const path = newFolderPath.trim();
+          if (!path) {
+            new obsidian.Notice('Enter a folder path first.');
+            return;
+          }
+          if (!this.plugin.settings.folderLockEnabled) {
+            new obsidian.Notice('Enable "Folder lock" below first.');
+            return;
+          }
+          await this.plugin.lockFolder(path);
+          this.display();
+        });
+      });
+
+    // === Options ===
+    containerEl.createEl('h3', { text: 'Options' });
 
     new obsidian.Setting(containerEl)
       .setName('Folder lock')
@@ -313,13 +418,7 @@ class FolderCryptoSettingTab extends obsidian.PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.folderLockEnabled = value;
             await this.plugin.saveSettings();
-            if (value) {
-              const locked = await this.plugin.lockConfiguredFolder();
-              if (!locked) {
-                this.plugin.settings.folderLockEnabled = false;
-                await this.plugin.saveSettings();
-              }
-            } else {
+            if (!value) {
               this.plugin.restoreAllFilesystemLocks();
               this.plugin.clearFolderDecorations();
               new obsidian.Notice('Folder lock disabled.');
@@ -328,19 +427,37 @@ class FolderCryptoSettingTab extends obsidian.PluginSettingTab {
           });
       });
 
+    if (!obsidian.Platform.isMobile) {
+      new obsidian.Setting(containerEl)
+        .setName('Sync Finder folder lock')
+        .setDesc('Also hide the underlying Finder folder while Folder lock is on. This does not change read permissions, so Obsidian can still open.')
+        .addToggle((toggle) => {
+          toggle
+            .setValue(this.plugin.settings.filesystemLockEnabled)
+            .onChange(async (value) => {
+              this.plugin.settings.filesystemLockEnabled = value;
+              if (value) {
+                this.plugin.applyFilesystemLocksForLockedFolders();
+              } else {
+                this.plugin.restoreAllFilesystemLocks();
+              }
+              await this.plugin.saveSettings();
+            });
+        });
+    }
+
+    // === Content Encryption ===
+    containerEl.createEl('h3', { text: 'Content encryption' });
+
     new obsidian.Setting(containerEl)
-      .setName('Sync Finder folder lock')
-      .setDesc('Also hide the underlying Finder folder while Folder lock is on. This does not change read permissions, so Obsidian can still open.')
-      .addToggle((toggle) => {
-        toggle
-          .setValue(this.plugin.settings.filesystemLockEnabled)
+      .setName('Encryption target folder')
+      .setDesc('Vault-relative folder used by the encrypt/decrypt commands and ribbon icon.')
+      .addText((text) => {
+        text
+          .setPlaceholder('Private')
+          .setValue(this.plugin.settings.folderPath)
           .onChange(async (value) => {
-            this.plugin.settings.filesystemLockEnabled = value;
-            if (value) {
-              this.plugin.applyFilesystemLocksForLockedFolders();
-            } else {
-              this.plugin.restoreAllFilesystemLocks();
-            }
+            this.plugin.settings.folderPath = normalizeFolderPath(value);
             await this.plugin.saveSettings();
           });
       });
@@ -373,6 +490,7 @@ module.exports = class FolderCryptoPlugin extends obsidian.Plugin {
   async onload() {
     await this.loadSettings();
     this.unlockedFolders = new Set();
+    this.unlockPromptPaths = new Set();
     this.restoreWorkspaceOpeners = null;
     this.fileExplorerObserver = null;
     this.decorationTimer = null;
@@ -470,6 +588,7 @@ module.exports = class FolderCryptoPlugin extends obsidian.Plugin {
     );
 
     this.safeRun('install workspace gate', () => this.installWorkspaceGate());
+    this.safeRun('install file explorer gate', () => this.installFileExplorerGate());
     this.safeRun('register file-open gate', () => {
       this.registerEvent(
         this.app.workspace.on('file-open', (file) => {
@@ -666,7 +785,7 @@ module.exports = class FolderCryptoPlugin extends obsidian.Plugin {
       if (!password) {
         return false;
       }
-      lock = Object.assign({ path: folder.path }, hashPassword(password));
+      lock = Object.assign({ path: folder.path }, await hashPassword(password));
       this.captureFilesystemMode(lock);
       this.settings.lockedFolders.push(lock);
       await this.saveSettings();
@@ -723,7 +842,7 @@ module.exports = class FolderCryptoPlugin extends obsidian.Plugin {
     if (!password) {
       return false;
     }
-    if (!verifyPassword(password, lock)) {
+    if (!await verifyPassword(password, lock)) {
       new obsidian.Notice('Wrong password.');
       return false;
     }
@@ -845,6 +964,30 @@ module.exports = class FolderCryptoPlugin extends obsidian.Plugin {
     };
   }
 
+  installFileExplorerGate() {
+    this.registerDomEvent(document, 'click', (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) {
+        return;
+      }
+      const titleEl = target.closest('.nav-folder-title[data-path], .tree-item-self[data-path]');
+      if (!titleEl) {
+        return;
+      }
+      const path = normalizeFolderPath(titleEl.getAttribute('data-path'));
+      if (!this.isPathLocked(path) || this.unlockPromptPaths.has(path)) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      this.unlockPromptPaths.add(path);
+      this.ensureUnlockedForPath(path)
+        .finally(() => {
+          this.unlockPromptPaths.delete(path);
+        });
+    }, { capture: true });
+  }
+
   closeLockedActiveLeaf(file) {
     window.setTimeout(async () => {
       if (!this.isPathLocked(file.path)) {
@@ -893,7 +1036,8 @@ module.exports = class FolderCryptoPlugin extends obsidian.Plugin {
   }
 
   clearFolderDecorations() {
-    document.querySelectorAll('.folder-crypto-lock-badge').forEach((el) => el.remove());
+    document.querySelectorAll(`.${LOCK_BADGE_CLASS}`).forEach((el) => el.remove());
+    document.querySelectorAll(`.${HIDDEN_ITEM_CLASS}`).forEach((el) => this.showFileExplorerElement(el));
   }
 
   decorateLockedFolders() {
@@ -901,14 +1045,19 @@ module.exports = class FolderCryptoPlugin extends obsidian.Plugin {
       this.clearFolderDecorations();
       return;
     }
-    const lockedPaths = new Set(this.settings.lockedFolders.map((entry) => entry.path));
-    document.querySelectorAll('.folder-crypto-lock-badge').forEach((badge) => {
+    const lockedPaths = new Set(
+      this.settings.lockedFolders
+        .filter((entry) => !this.unlockedFolders.has(entry.path))
+        .map((entry) => entry.path)
+    );
+    document.querySelectorAll(`.${LOCK_BADGE_CLASS}`).forEach((badge) => {
       const titleEl = badge.closest('.nav-folder-title[data-path], .tree-item-self[data-path]');
       const path = titleEl ? normalizeFolderPath(titleEl.getAttribute('data-path')) : '';
       if (!lockedPaths.has(path)) {
         badge.remove();
       }
     });
+    document.querySelectorAll(`.${HIDDEN_ITEM_CLASS}`).forEach((el) => this.showFileExplorerElement(el));
     if (!lockedPaths.size) {
       return;
     }
@@ -918,15 +1067,59 @@ module.exports = class FolderCryptoPlugin extends obsidian.Plugin {
         return;
       }
       const contentEl = titleEl.querySelector('.nav-folder-title-content, .tree-item-inner') || titleEl;
-      if (contentEl.querySelector('.folder-crypto-lock-badge')) {
+      if (contentEl.querySelector(`.${LOCK_BADGE_CLASS}`)) {
         return;
       }
       const badge = document.createElement('span');
-      badge.className = 'folder-crypto-lock-badge';
+      badge.className = LOCK_BADGE_CLASS;
       badge.textContent = ' 🔒';
       badge.setAttribute('aria-label', 'Folder locked by Folder Crypto');
       contentEl.appendChild(badge);
     });
+    this.hideLockedFolderDescendants(lockedPaths);
+  }
+
+  hideLockedFolderDescendants(lockedPaths) {
+    document.querySelectorAll('.nav-folder-title[data-path], .tree-item-self[data-path]').forEach((titleEl) => {
+      const path = normalizeFolderPath(titleEl.getAttribute('data-path'));
+      if (!lockedPaths.has(path)) {
+        return;
+      }
+      const folderEl = titleEl.closest('.nav-folder, .tree-item');
+      const childrenEl = folderEl?.querySelector(':scope > .nav-folder-children, :scope > .tree-item-children');
+      if (childrenEl) {
+        this.hideFileExplorerElement(childrenEl);
+      }
+    });
+
+    document.querySelectorAll('.nav-file-title[data-path], .nav-folder-title[data-path], .tree-item-self[data-path]').forEach((titleEl) => {
+      const path = normalizeFolderPath(titleEl.getAttribute('data-path'));
+      const isHiddenDescendant = Array.from(lockedPaths).some((lockedPath) => {
+        return path !== lockedPath && pathIsInsideFolder(path, lockedPath);
+      });
+      if (!isHiddenDescendant) {
+        return;
+      }
+      const itemEl = titleEl.closest('.nav-file, .nav-folder, .tree-item') || titleEl;
+      this.hideFileExplorerElement(itemEl);
+    });
+  }
+
+  hideFileExplorerElement(el) {
+    if (el.classList.contains(HIDDEN_ITEM_CLASS)) {
+      return;
+    }
+    el.dataset.folderCryptoPreviousDisplay = el.style.display || '';
+    el.classList.add(HIDDEN_ITEM_CLASS);
+    el.setAttribute('aria-hidden', 'true');
+    el.style.display = 'none';
+  }
+
+  showFileExplorerElement(el) {
+    el.style.display = el.dataset.folderCryptoPreviousDisplay || '';
+    delete el.dataset.folderCryptoPreviousDisplay;
+    el.removeAttribute('aria-hidden');
+    el.classList.remove(HIDDEN_ITEM_CLASS);
   }
 
   getFolder(folderPath) {
@@ -1017,9 +1210,9 @@ module.exports = class FolderCryptoPlugin extends obsidian.Plugin {
               await this.app.vault.adapter.write(backupPath, content);
             }
           }
-          await this.app.vault.modify(file, encryptText(content, password));
+          await this.app.vault.modify(file, await encryptText(content, password));
         } else {
-          await this.app.vault.modify(file, decryptText(content, password));
+          await this.app.vault.modify(file, await decryptText(content, password));
         }
         changed += 1;
       } catch (error) {

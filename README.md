@@ -6,7 +6,7 @@ Local Obsidian plugin with two folder-protection modes.
 
 `Folder lock` is the master switch for locking the configured folder in Obsidian.
 
-This mode locks a folder inside Obsidian. A locked folder shows a lock badge in the file explorer. When a file inside that folder is opened, the plugin asks for the password. After successful unlock, every file in that folder is readable until Obsidian is closed or `Lock all Folder Crypto folders` is run.
+This mode locks a folder inside Obsidian. A locked folder shows a lock badge in the file explorer, while its child files and subfolders are hidden from the file tree. Clicking the locked folder asks for the password. When a file inside that folder is opened from another route, the plugin also asks for the password. After successful unlock, every file in that folder is visible and readable until Obsidian is closed or `Lock all Folder Crypto folders` is run.
 
 `Sync Finder folder lock` is the small switch under it. When enabled, folder locking also hides the underlying folder in Finder with `chflags hidden`. Unlocking shows it again with `chflags nohidden`. It does not change read permissions, so Obsidian can still open and scan the vault.
 
